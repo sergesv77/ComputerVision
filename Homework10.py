@@ -8,13 +8,27 @@ from matplotlib.animation import FuncAnimation
 import threading
 import imutils
 
-FFMPEG_BIN = os.getcwd() + '\\ffmpeg\\ffmpeg.exe'
-cam_url = 'https://eu5.camflg.com:5443/LiveApp/streams/015290301572984587686747.m3u8?token=undefined'
+global_exit = False
 
-video_size_w = 1280
-video_size_h = 720
+# video stream settings
+FFMPEG_BIN = os.getcwd() + '\\ffmpeg\\ffmpeg.exe'  # using external tool to retrieve frames from http source (no rtsp)
+# cam_url = 'https://eu5.camflg.com:5443/LiveApp/streams/015290301572984587686747.m3u8?token=undefined' # 1280x720
+# cam_url = 'https://eu5.camflg.com:5443/LiveApp/streams/129763646084267746564546.m3u8?token=undefined'
+cam_url = 'https://eu5.camflg.com:5443/LiveApp/streams/875330193606328046540894.m3u8?token=undefined' ## 1920x1080
+
+video_size_w = 1920
+video_size_h = 1080
 video_channels = 3
 
+target_video_size_w = 960
+target_video_size_h = 540
+
+# general cv options
+font = cv2.FONT_HERSHEY_SIMPLEX
+out_video = cv2.VideoWriter('d:\\detection_tracking8.avi', cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'), 10, (target_video_size_w, target_video_size_h))
+
+
+# opencv pedestrian detector initialization
 NMS_THRESHOLD = 0.3
 MIN_CONFIDENCE = 0.2
 
@@ -27,7 +41,7 @@ config_path = model_path + 'yolov4-tiny.cfg'
 
 model = cv2.dnn.readNetFromDarknet(config_path, weights_path)
 layer_name = model.getLayerNames()
-layer_name = [layer_name[i-1] for i in model.getUnconnectedOutLayers()]
+layer_name = [layer_name[i - 1] for i in model.getUnconnectedOutLayers()]
 
 # opening video stream from a public webcam
 pipe = sp.Popen([FFMPEG_BIN, "-i", cam_url,
@@ -38,12 +52,14 @@ pipe = sp.Popen([FFMPEG_BIN, "-i", cam_url,
                  "-vcodec", "rawvideo", "-"],
                 stdin=sp.PIPE, stdout=sp.PIPE, bufsize=video_size_w * (video_size_h + 18) * video_channels)
 
-# global video frame buffer
-video_frames = []
+# global video frame buffers and counters
+raw_video_frames = []
+processed_video_frames = []
 
-hog = cv2.HOGDescriptor()
-hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+raw_frame_counter = 0
+processed_frame_counter = 0
 
+tracker_update_interval = 100  # all trackers will be updated (detector will run) every XX frames specified in this setting
 
 def pedestrian_detection(image, model, layer_name, personidz=0):
     (H, W) = image.shape[:2]
@@ -84,74 +100,128 @@ def pedestrian_detection(image, model, layer_name, personidz=0):
 
 # continuous buffering - collect frames as fast as we can
 def process_video(frame_buffer):
-    while True:
+    global raw_frame_counter
+    while True and not global_exit:
+        start = time.perf_counter()
         raw_image = pipe.stdout.read(video_size_w * video_size_h * video_channels)
         image = np.frombuffer(raw_image, dtype='uint8')
-        image = image.reshape((video_size_h, video_size_w, video_channels))
+        image = imutils.resize(image.reshape((video_size_h, video_size_w, video_channels)), target_video_size_w, target_video_size_h)
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         pipe.stdout.flush()
+        raw_frame_counter += 1
         frame_buffer.append(image)
         if len(frame_buffer) > 1:
             frame_buffer.pop(0)  # clean up buffer, only keep the last frame
+        processing_time = time.perf_counter() - start
+        time.sleep(max(1 / 30 - processing_time, 0))
+        total_time = time.perf_counter() - start
+        # print(f'\rRetrieving {1 / total_time} frames/sec', end='')
+    return True
 
 
 # run frame buffering (the function above) in a separate thread
-thread = threading.Thread(target=process_video, args=[video_frames])
+thread = threading.Thread(target=process_video, args=[raw_video_frames])
 thread.start()
 
 
-# retrieve next frame from buffer once we are ready to process it
-def GetFrame(frame_buffer, wait_timeout=20):
-    original_image = None
-    waiting = 0
-    wait_interval = 0.1
-    while not frame_buffer and waiting < wait_timeout:
-        time.sleep(wait_interval)
-        waiting += wait_interval
-    if frame_buffer:
-        original_image = frame_buffer[0]
-    return original_image
+# detection and tracking here
+def process_frame(input_frame_buffer, output_frame_buffer):
+
+    def write_video(img):
+        out_video.write(img)
+
+    def update_trackers(trackers, img, color):
+        for tracker in trackers:
+            ok, tbox = tracker.update(img)
+            x1, y1 = tbox[0], tbox[1]
+            width, height = tbox[2], tbox[3]
+            cv2.rectangle(img, (x1, y1), (x1 + width, y1 + height), color, 2)
+
+    global processed_frame_counter
+    # wait until first frame appears
+    while not input_frame_buffer:
+        time.sleep(0.1)
+
+    # process frame and drop it to the output buffer
+    while True and not global_exit:
+        start = time.perf_counter()
+        image = input_frame_buffer[0]
+
+        # detect pedestrians on the video for every {tracker_update_interval} frame. Will work for the very first frame - index 0
+        if processed_frame_counter % tracker_update_interval == 0:  #large number (rare update) will give us good example of how good tracker is
+            # re-create all trackers
+            CSRT_trackers = []
+            KCF_trackers = []
+
+            # running detection
+            results = pedestrian_detection(image, model, layer_name, personidz=LABELS.index('person'))
+            for res in results:
+                x1 = res[1][0]
+                y1 = res[1][1]
+                x2 = res[1][2]
+                y2 = res[1][3]
+
+                # we can draw a green rectangle to mark detector results (it good :) )
+                #cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                tbox = (x1, y1, x2 - x1, y2 - y1)
+
+                if results.index(res) % 2 == 0:  # odd object number
+                    tracker = cv2.TrackerCSRT_create()
+                    ok = tracker.init(image, tbox)
+                    CSRT_trackers.append(tracker)
+                else:  # even object number
+                    tracker = cv2.TrackerKCF_create()
+                    ok = tracker.init(image, tbox)
+                    KCF_trackers.append(tracker)
+
+        #  NOTE: I've found that on the video all texts added to the image with cv2.putText() and all frames are converted from RGB to BRG
+        #  pyplot shows all colors correctly
+
+        update_trackers(CSRT_trackers, image, (255, 0, 0))  # RED for CSRT
+        update_trackers(KCF_trackers, image, (0, 0, 255))  # BLUE for KCF
+
+        cv2.putText(image, f'Frame: {processed_frame_counter}', (10, 40), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(image, f'Update trackers every {tracker_update_interval} frames', (10, 80), font, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(image, f'Total  {len(CSRT_trackers)+len(KCF_trackers)} active trackers', (10, 120), font, 1, (0, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(image, 'RED - CSRT', (target_video_size_w - 220, 40), font, 1, (255, 0, 0), 4, cv2.LINE_8)
+        cv2.putText(image, 'BLUE - KCF', (target_video_size_w - 220, 80), font, 1, (0, 0, 255), 4, cv2.LINE_AA)
+
+        output_frame_buffer.append(image)
+        write_video(image)
+        processed_frame_counter += 1
+        # print('frame processed')
+        if len(output_frame_buffer) > 1:
+            output_frame_buffer.pop(0)
+        processing_time = time.perf_counter() - start
+        # print(f'\rProcessing {1/processing_time} frames/sec', end='')
+        # print(f'\rProcessing frame {processed_frame_counter}', end='')
+    return True
 
 
-# Run detection and tracking here
-def process_frame(image):
-    # A not-very-good opencv pedestrian detector
-    # img_result = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    # (regions, _) = hog.detectMultiScale(image,
-    #                                     winStride=(4, 4),
-    #                                     padding=(8, 8),
-    #                                     scale=0.95)
-    # for (x, y, w, h) in regions:
-    #     cv2.rectangle(image, (x, y),
-    #                   (x + w, y + h),
-    #                   (0, 0, 255), 2)
+while not raw_video_frames:
+    time.sleep(0.1)
 
-    # img_copy = imutils.resize(image, width=700)
-    # img_copy = np.copy(image)
-    results = pedestrian_detection(image, model, layer_name, personidz=LABELS.index('person'))
-    for res in results:
-        cv2.rectangle(image, (res[1][0], res[1][1]), (res[1][2], res[1][3]), (0, 255, 0), 2)
+# process image in a separate thread
+thread_p = threading.Thread(target=process_frame, args=[raw_video_frames, processed_video_frames])
+thread_p.start()
 
-    return image
-
+# wait until first processed video frame appears
+while not processed_video_frames:
+    time.sleep(0.1)
 
 ax1 = plt.subplot(111)
-
-# create axes
-im1 = ax1.imshow(process_frame(GetFrame(video_frames)))
+im1 = ax1.imshow(processed_video_frames[0])
 
 
 def update(i):
-    im1.set_data(process_frame(GetFrame(video_frames)))
+    if processed_video_frames:
+        im1.set_data(processed_video_frames[0])
 
 
 ani = FuncAnimation(plt.gcf(), update, interval=50)
 
 plt.show()
 
-# try:
-#     while video.isOpened():
-#         ret, frame = video.read()
-#         cv2.imshow('video', frame)
-#         time.sleep(5)
-# finally:
-#     video.release()
+global_exit = True
